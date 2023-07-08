@@ -1,0 +1,189 @@
+#####################################
+########### Documentation ###########
+#####################################
+# What is the process?
+# 1. Generate doxygen xml files using Doxygen (The Doxyfile.in is the configuration for Doxygen)
+# 2. Use Sphinx to generate the actual documentation (Configured in conf.py)
+# 3. The breathe extension for Sphinx can parse the doxygen's generated xmls and integrate them with Sphinx
+#
+# Based on the tutorial in https://devblogs.mirosoft.com/cppblog/clear-functional-c-documentation-with-sphinx-breathe-doxygen-cmake/
+
+
+#####################################
+########### CMake Version ###########
+#####################################
+cmake_minimum_required(VERSION 3.14)
+project(
+	cmake-sphinx
+	VERSION 1.0.0
+)
+
+
+#####################################
+########### Dependencies ############
+#####################################
+# Add the cmake directory to the module path.
+set(CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
+
+# Using `FindXoxygen.cmake` (builtin) and `cmake/FindSphinx.cmake`.
+find_package(Doxygen REQUIRED)
+find_package(Sphinx REQUIRED)
+
+
+#####################################
+############# Functions #############
+#####################################
+#[[ Creates a documentation CMake target.
+
+Creates a target that parses the conf.py and .rst documents in the current directory and creates a sphinx site as an output.
+
+Args:
+	TARGET: The name of the target.
+#]]
+macro(add_docs TARGET)
+	# Configure the sphinx configuration file - replace @VAR@ with values.
+	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/conf.py ${CMAKE_CURRENT_BINARY_DIR}/conf.py @ONLY)
+	
+	# Create our new target.
+	add_custom_target(${TARGET} ALL)
+	
+	# This command will build the documentation using sphinx.
+	add_custom_command(
+		# Set this command to run after the build of the target.
+		# This is a hack to later allow us to set the doxygen to run before this target.
+		# This is required because CMAKE doesn't support PRE_BUILD and PRE_LINK
+		# correctly for custom_targets.
+		TARGET
+			${TRAGET}
+		POST_BUILD
+		COMMAND
+			# Create a work-space directory to which generated .rst files will be saved.
+			${CMAKE_COMMAND} -E copy_directory
+			${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_BINARY_DIR}/generated
+		COMAMND
+			# Use the conf.py we have configured,
+			# this is better than `-c` since it keeps all the pathing simple.
+			${CMAKE_COMMAND} -E copy
+			${CMAKE_CURRENT_BINARY_DIR}/conf.py ${CMAKE_CURRENT_BINARY_DIR}/generated/
+		COMMAND
+			# This command sets the `PYTHONPATH` environment to be `SPHINX_PYTHON_PATH` property.
+			${CMAKE_COMMAND} -E env PYTHONPATH=$<TARGET_PROPERTY:${TARGET},SPHINX_PYTHON_PATH>
+			${SPHINX_EXECUTABLE} -b html
+			# Let the doxygen function add configurations to sphinx.
+			-Dbreathe_projects.Project=${CMAKE_CURRENT_BINARY_DIR}/doxygen/xml
+			-Dbreathe_default_project=Project
+			# The generated files directory will be sphinx's input directory.
+			${CMAKE_CURRENT_BINARY_DIR}/generated
+			# Set the output directory.
+			${CMAKE_CURRENT_BINARY_DIR}/sphinx
+		DEPENDS
+			${CMAKE_CURRENT_SOURCE_DIR}/*
+		MAIN_DEPENDENCY
+			${CMAKE_CURRENT_BINARY_DIR}/conf.py
+		COMMENT
+			"Generating documentation site with sphinx"
+		VERBATIM
+	)
+endmacro()
+
+
+#[[ Use Doxygen on your C/C++ code to add it to your docs site.
+
+Adds a stage to the documentation generation process that parses (using doxygen)
+the given source folder and adds the sources as a reference-able directive in the sphinx rst
+files.
+
+NOTE: Currently this doesn't support multiple source folders (even not via re-invocation).
+
+Args:
+	TARGET: The docs target to add the doxygen processing to.
+	SOURCE_DIR: The directory in which the sources are contained.
+	
+#]]
+function(docs_add_doxygen)
+	# Parse the arguments:
+	# 	Options: -
+	# 	OneValue: TARGET, SOURCE_DIR
+	# 	MultiValue: -
+	cmake_parse_arguments(ARG "" "TARGET;SOURCE_DIR" "" ${ARGN})
+	
+	# Find all the headers/sources in the source dir - marks when the docs needs to be rebuilt.
+	file(GLOB_RECURSE PROJECT_HEADERS ${ARG_SOURCE_DIR}/*.h ${ARG_SOURCE_DIR}/*.hpp)
+	file(GLOB_RECURSE PROJECT_SOURCES ${ARG_SOURCE_DIR}/*.c ${ARG_SOURCE_DIR}/*.cpp)
+	
+	# These values are passed to the Doxyfile (via @VAR@) and marks the input/output.
+	set(DOXYGEN_OUTPUT_DIR ${CMAKE_CURRENT_BINARY_DIR}/doxygen)
+	set(DOXYGEN_INPUT_DIR ${ARG_SOURCE_DIR})
+	
+	# Replace vaiables inside @@ with current values.
+	configure_file(${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile @ONLY)
+	
+	# This command invokes the doxygen command and will generate the xml files.
+	add_custom_command(
+		TARGET
+			${ARG_TARGET}
+		PRE_BUILD
+		DEPENDS
+			# Whenever these files chagne, the target needs to be rebuilt.
+			${PROJECT_HEADERS}
+			${PROJECT_SOURCES}
+		COMMAND
+			# Create the output directory.
+			${CMAKE_COMMAND} -E make_directory ${DOXYGEN_OUTPUT_DIR}
+		COMMAND
+			# Run the doxygen generator with the configured Doxyfile.
+			${DOXYGEN_EXECUTABLE} ${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+		MAIN_DEPENDENCY
+			# Whenever these files chagne, the target needs to be rebuilt.
+			${CMAKE_CURRENT_BINARY_DIR}/Doxyfile
+			${CMAKE_CURRENT_SOURCE_DIR}/Doxyfile
+		COMMENT
+			"Generating code data with Doxygen"
+		VERBATIM
+	)
+endfunction()
+
+
+#[[ Adds your python code to be available in sphinx documentation.
+
+Configures sphinx's python environment to include the given sources.
+May be invoked multiple times for many source folders.
+
+NOTE: This feature uses the PYTHONPATH environment variable, any preexisting values are deleted.
+
+Args:
+	TARGET: The docs target to add the python sources to.
+	SOURCE_DIR: The directory in which the sources are contained.
+#]]
+function(docs_add_python)
+	# Parse the arguments:
+	# 	Options: -
+	# 	OneValue: TARGET, SOURCE_DIR
+	# 	MultiValue: -
+	cmake_parse_arguments(ARG "" "TARGET;SOURCE_DIR" "" ${ARGN})
+	
+	# This function sets a 'target_property' with the given values,
+	# that shall later be used as the sphinx command's PYTHONPATH environment variable.
+	
+	# Get any previous value set by past calls to this function.
+	# `get_property` is used instead of `get_target_property`
+	# because is't output values are more convenient in case the value is empty.
+	get_property(
+		PREVIOUS_SPHINX_PATH
+		TARGET ${ARG_TARGET}
+		PROPERTY SPHINX_PYTHON_PATH
+	)
+	
+	# If there's a previous value concat them with `:`, otherwise just use the given value.
+	if("${PREVIOUS_SPHINX_PYTHON_PATH}" STREQUAL "")
+		set_target_properties(
+			${ARG_TARGET} PROPERTIES
+			SPHINX_PYTHON_PATH ${ARG_SOURCE_DIR}
+		)
+	else()
+		set_target_properties(
+			${ARG_TARGET} PROPERTIES
+			SPHINX_PYTHON_PATH ${ARG_SOURCE_DIR}:${PREVIOUS_SPHINX_PYTHON_PATH}
+		)
+	endif()
+endfunction()
